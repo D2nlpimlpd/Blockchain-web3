@@ -334,8 +334,5 @@ The exact interaction pattern with the contract depends on how `backend/controll
 
 ---
 
-## License
 
-For example:
 
-    MIT License — see LICENSE file for details.
