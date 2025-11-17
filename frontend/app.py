@@ -1,132 +1,557 @@
-import sys, os
+# frontend/app.py
+import sys
+import os
+
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import streamlit as st
 import pandas as pd
 import time
 import json
-import altair as alt
 from dotenv import load_dotenv
-from web3 import Web3
+
+# Plotly
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
 from backend.controller import simulate_step
 from backend.web3_api import w3
 
 load_dotenv()
 
-# == 初始化合约 ==
+# ================= Web3 / Contract =================
 with open("backend/AlgoStableV2_abi.json") as f:
     abi = json.load(f)
 
-try:
-    STABLE_ADDR = w3.to_checksum_address(os.getenv("STABLE_ADDR"))
-    ACCOUNT_ADDRESS = w3.to_checksum_address(os.getenv("ACCOUNT_ADDRESS"))
-except Exception as e:
-    st.error(f"⚠️ 地址格式错误，请检查 .env 文件中的地址: {e}")
-    st.stop()
 
-stable_contract = w3.eth.contract(address=STABLE_ADDR, abi=abi)
+def _addr(x):
+    try:
+        return w3.to_checksum_address(x) if x else None
+    except Exception:
+        return None
 
-# === 检查链上连接状态 ===
+
+STABLE_ADDR = _addr(os.getenv("STABLE_ADDR"))
+ACCOUNT_ADDRESS = _addr(os.getenv("ACCOUNT_ADDRESS"))
+
 try:
-    block_number = w3.eth.block_number
+    stable_contract = (
+        w3.eth.contract(address=STABLE_ADDR, abi=abi) if STABLE_ADDR else None
+    )
+    _ = w3.eth.block_number
     chain_ok = True
-    chain_status = f"✅ 已连接 Sepolia 区块链（最新区块：{block_number}）"
+    chain_status = "✅ Web3 connection OK"
 except Exception:
     chain_ok = False
-    chain_status = "⚠️ 无法连接区块链，将自动切换为本地模拟模式"
+    stable_contract = None
+    chain_status = "⚠️ Cannot connect to blockchain, falling back to local simulation"
 
-# === Streamlit 页面 ===
-st.set_page_config(page_title="LUNA UST 链上崩盘模拟", layout="wide")
-st.title("🪙 LUNA–UST 链上算法稳定币崩盘模拟器")
+# ================= Page config =================
+st.set_page_config(
+    page_title="LUNA–UST Simulation (Historical-style)",
+    layout="wide",
+)
+st.title("🪙 LUNA–UST Collapse Simulator ")
 
-st.sidebar.header("📊 当前链上状态")
+st.sidebar.header("📊 Status")
 st.sidebar.write(chain_status)
 
-# 尝试获取链上状态
-try:
-    price = stable_contract.functions.price().call() / 1e18
-except Exception:
-    price = 1.0
+# ================= Terra May 2022 preset (v4 params) =================
+def terra_may_2022_preset() -> dict:
+    state = {
+        "ust_supply": 18_000_000_000.0,
+        "luna_supply": 350_000_000.0,
+        "ust_price": 1.0,
+        "luna_price": 80.0,
+        # AMM pool: initial marginal price ≈ CEX
+        "pool_ust": 800_000_000.0,
+        "pool_luna": 800_000_000.0 / 80.0,
+        # LFG reserve
+        "lfg_reserve_usd": 2_000_000_000.0,
+        "lfg_reserve0": 2_000_000_000.0,
+        "luna_price_hist": [80.0],
+        # External shocks: moderate, mainly to trigger de-peg
+        "ext_events": [
+            {"step": 20, "type": "ust_sell", "usd": 250_000_000, "latency": 0},
+            {"step": 28, "type": "ust_sell", "usd": 300_000_000, "latency": 0},
+            {"step": 36, "type": "luna_sell", "usd": 200_000_000, "latency": 0},
+            {"step": 48, "type": "ust_sell", "usd": 600_000_000, "latency": 0},
+            {"step": 60, "type": "ust_sell", "usd": 900_000_000, "latency": 0},
+            {"step": 80, "type": "luna_sell", "usd": 300_000_000, "latency": 0},
+            {"step": 110, "type": "ust_sell", "usd": 1_500_000_000, "latency": 0},
+        ],
+        # v4 parameters (must be in sync with backend.model.default_params)
+        "params": {
+            "amm_fee": 0.003,
+            "max_trade_mult": 8.0,
+            # Redemption / expansion: conservative, slows LUNA supply explosion
+            "redeem_alpha": 0.04,
+            "max_redeem_usd_frac": 0.03,
+            "max_luna_mint_frac_of_supply": 0.30,
+            # Bank run (strength increases over time)
+            "bankrun_low": 0.0,
+            "bankrun_high": 0.06,
+            "bankrun_t0": 150,
+            "bankrun_tau": 45,
+            "max_bankrun_frac": 0.04,
+            # Delayed sell queue (LUNA -> CEX)
+            "luna_cex_release_rate": 0.25,
+            "arbitrage_to_cex_beta": 0.80,
+            # CEX depth & impact limits
+            "cex_depth_ust": 80_000_000.0,
+            "cex_depth_luna": 80_000_000.0,
+            "depth_halflife_steps": 800,
+            "impact_coeff": 0.8,
+            "max_log_up_ust": 0.12,
+            "max_log_dn_ust": 0.18,
+            "max_log_up_luna": 0.22,
+            "max_log_dn_luna": 0.40,
+            # Oracle delay
+            "oracle_delay": 10,
+            # LFG: intervenes on small/mid depegs, stops on deep depeg
+            "lfg_trigger": 0.997,
+            "lfg_per_step_usd": 400_000_000.0,
+            "lfg_effectiveness": 0.35,
+            "lfg_effect_decay": 0.6,
+            "lfg_cutoff_depeg": 0.45,
+            # LP withdrawal
+            "pool_drain_base": 0.002,
+            "pool_drain_slope": 0.020,
+            # Hard bounds
+            "ust_min": 1e-3,
+            "ust_max": 1.02,
+            "luna_min": 1e-8,
+            "luna_max": 5e4,
+        },
+    }
+    return state
 
-try:
-    balance = stable_contract.functions.balanceOf(ACCOUNT_ADDRESS).call() / 1e18
-except Exception:
-    balance = 0.0
 
-st.sidebar.write(f"合约地址： `{STABLE_ADDR}`")
-st.sidebar.write(f"账户地址： `{ACCOUNT_ADDRESS}`")
-st.sidebar.metric("UST 余额", f"{balance:,.2f} UST")
-st.sidebar.metric("当前价格", f"{price:.4f} USD")
-
-# === 模拟参数初始化 ===
-state = {
-    "ust_supply": 1_000_000,
-    "luna_supply": 1_000_000,
-    "peg_ust": 1_000_000,
-    "peg_luna": 1_000_000,
-    "ust_price": price,
-    "luna_price": 100.0,
-}
+state = terra_may_2022_preset()
 data = []
 
-# === 模式选择 ===
+# ================= Run mode =================
 st.markdown("---")
 mode = st.selectbox(
-    "请选择运行模式：",
-    ["🧮 本地模拟（快速）", "🔗 链上模式（真实交易）"],
-    index=0 if not chain_ok else 1
+    "Run mode:",
+    ["🧮 Local simulation (recommended)", "🔗 On-chain mode (requires contract/keys)"],
+    index=0 if not chain_ok else 1,
 )
 use_onchain = mode.startswith("🔗") and chain_ok
-
 if not chain_ok and use_onchain:
-    st.warning("⚠️ 链上连接不可用，已自动切换到本地模式。")
+    st.warning("⚠️ Web3 is not available, switched back to local simulation.")
     use_onchain = False
 
-st.write(f"当前运行模式：{'🔗 链上模式（真实交易）' if use_onchain else '🧮 本地模拟（仅本地计算）'}")
+# ================= Plot: 4×2 dashboard (smoothed) =================
+def build_figure(df: pd.DataFrame) -> go.Figure:
+    # --- Simple smoothing (rolling mean) ---
+    def smooth(s, window=5):
+        return s.rolling(window=window, min_periods=1, center=True).mean()
 
-# === 模拟主逻辑 ===
-if st.button("开始模拟"):
-    st.info("模拟进行中，请稍等...")
-    chart_area = st.empty()
+    fig = make_subplots(
+        rows=4,
+        cols=2,
+        subplot_titles=(
+            "💎 LUNA Spot Price (CEX)",
+            "🟩 UST Spot Price (CEX)",
+            "🔥 LUNA Mint / Burn / Total Supply",
+            "💧 UST Mint / Burn / Total Supply",
+            "🏛️ AMM vs CEX: LUNA Price (USD)",
+            "🏦 LFG Reserve / Intervention & Price Spreads",
+            "🧮 AMM Pool Balances (UST & LUNA)",
+            "⚙️ AMM Constant Product k (relative) & UST Share",
+        ),
+        specs=[
+            [{}, {}],
+            [{"secondary_y": True}, {"secondary_y": True}],
+            [{}, {"secondary_y": True}],
+            [{"secondary_y": True}, {"secondary_y": True}],
+        ],
+        vertical_spacing=0.11,
+        horizontal_spacing=0.08,
+    )
 
-    for step in range(300):  
-        state = simulate_step(state, stable_contract, use_onchain=use_onchain)
-        data.append({
-            "Step": step,
-            "UST Price": state["ust_price"],
-            "LUNA Price": state["luna_price"],
-        })
+    # ========== Row 1: prices (smoothed + spline) ==========
+    fig.add_trace(
+        go.Scatter(
+            x=df["Step"],
+            y=smooth(df["LUNA Price"], window=5),
+            mode="lines",
+            name="LUNA (CEX)",
+            line=dict(color="#1f77b4", width=2),
+            line_shape="spline",
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df["Step"],
+            y=smooth(df["UST Price"], window=5),
+            mode="lines",
+            name="UST (CEX)",
+            line=dict(color="#d62728", width=2),
+            line_shape="spline",
+        ),
+        row=1,
+        col=2,
+    )
+
+    # ========== Row 2: supply + mint/burn ==========
+    # LUNA supply
+    fig.add_trace(
+        go.Scatter(
+            x=df["Step"],
+            y=df["LUNA Supply"],
+            mode="lines",
+            name="LUNA Supply",
+            line=dict(color="#7f7f7f", width=2),
+            line_shape="spline",
+        ),
+        row=2,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=df["Step"],
+            y=df["LUNA Minted"],
+            name="LUNA Minted",
+            marker_color="#2ca02c",
+            opacity=0.6,
+        ),
+        row=2,
+        col=1,
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=df["Step"],
+            y=df["LUNA Burned"],
+            name="LUNA Burned",
+            marker_color="#d62728",
+            opacity=0.6,
+        ),
+        row=2,
+        col=1,
+        secondary_y=True,
+    )
+
+    # UST supply
+    fig.add_trace(
+        go.Scatter(
+            x=df["Step"],
+            y=df["UST Supply"],
+            mode="lines",
+            name="UST Supply",
+            line=dict(color="#7f7f7f", width=2),
+            line_shape="spline",
+        ),
+        row=2,
+        col=2,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=df["Step"],
+            y=df["UST Minted"],
+            name="UST Minted",
+            marker_color="#2ca02c",
+            opacity=0.6,
+        ),
+        row=2,
+        col=2,
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Bar(
+            x=df["Step"],
+            y=df["UST Burned"],
+            name="UST Burned",
+            marker_color="#d62728",
+            opacity=0.6,
+        ),
+        row=2,
+        col=2,
+        secondary_y=True,
+    )
+
+    # ========== Row 3: AMM vs CEX + LFG ==========
+    # LUNA price CEX vs AMM (USD)
+    fig.add_trace(
+        go.Scatter(
+            x=df["Step"],
+            y=smooth(df["LUNA Price"], window=5),
+            mode="lines",
+            name="LUNA (CEX, USD)",
+            line=dict(color="#1f77b4", width=2),
+            line_shape="spline",
+        ),
+        row=3,
+        col=1,
+    )
+
+    if "AMM LUNA Price (USD)" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=smooth(df["AMM LUNA Price (USD)"], window=5),
+                mode="lines",
+                name="LUNA (AMM, USD)",
+                line=dict(color="#ff7f0e", width=2, dash="dot"),
+                line_shape="spline",
+            ),
+            row=3,
+            col=1,
+        )
+
+    # Spreads + LFG
+    if "Spread UST" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=smooth(df["Spread UST"], window=5),
+                mode="lines",
+                name="UST spread (CEX - 1)",
+                line=dict(color="#9467bd"),
+                line_shape="spline",
+            ),
+            row=3,
+            col=2,
+            secondary_y=False,
+        )
+    if "Spread LUNA" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=smooth(df["Spread LUNA"], window=5),
+                mode="lines",
+                name="LUNA spread (CEX - AMM)",
+                line=dict(color="#8c564b", dash="dot"),
+                line_shape="spline",
+            ),
+            row=3,
+            col=2,
+            secondary_y=False,
+        )
+    if "LFG Reserve" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=df["LFG Reserve"],
+                mode="lines",
+                name="LFG Reserve (USD)",
+                line=dict(color="#2ca02c", width=3),
+                line_shape="spline",
+            ),
+            row=3,
+            col=2,
+            secondary_y=True,
+        )
+    if "LFG Spent" in df:
+        fig.add_trace(
+            go.Bar(
+                x=df["Step"],
+                y=df["LFG Spent"],
+                name="LFG spent this step (USD)",
+                marker_color="#17becf",
+                opacity=0.5,
+            ),
+            row=3,
+            col=2,
+            secondary_y=True,
+        )
+
+    # ========== Row 4: pool balances + k / share / slippage ==========
+    if "Pool UST" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=df["Pool UST"],
+                mode="lines",
+                name="Pool UST",
+                line=dict(color="#1f9a4b"),
+                line_shape="spline",
+            ),
+            row=4,
+            col=1,
+            secondary_y=False,
+        )
+    if "Pool LUNA" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=df["Pool LUNA"],
+                mode="lines",
+                name="Pool LUNA",
+                line=dict(color="#e377c2", dash="dot"),
+                line_shape="spline",
+            ),
+            row=4,
+            col=1,
+            secondary_y=True,
+        )
+
+    if "Pool K Rel" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=df["Pool K Rel"],
+                mode="lines",
+                name="k / k0",
+                line=dict(color="#ff7f0e", width=2),
+                line_shape="spline",
+            ),
+            row=4,
+            col=2,
+            secondary_y=True,
+        )
+    if "Pool UST Share" in df:
+        fig.add_trace(
+            go.Scatter(
+                x=df["Step"],
+                y=df["Pool UST Share"],
+                mode="lines",
+                name="UST share (0–1)",
+                line=dict(color="#1f77b4"),
+                line_shape="spline",
+            ),
+            row=4,
+            col=2,
+            secondary_y=False,
+        )
+    if "Slippage" in df:
+        fig.add_trace(
+            go.Bar(
+                x=df["Step"],
+                y=df["Slippage"],
+                name="Slippage (this step)",
+                marker_color="#d62728",
+                opacity=0.35,
+            ),
+            row=4,
+            col=2,
+            secondary_y=False,
+        )
+
+    # ========== Axes & layout ==========
+    for r in [1, 2, 3, 4]:
+        fig.update_xaxes(title_text="Step", row=r, col=1)
+        fig.update_xaxes(title_text="Step", row=r, col=2)
+
+    fig.update_yaxes(title_text="USD", row=1, col=1)
+    fig.update_yaxes(title_text="USD", row=1, col=2)
+    fig.update_yaxes(title_text="Supply", row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Mint / Burn", row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Supply", row=2, col=2, secondary_y=False)
+    fig.update_yaxes(title_text="Mint / Burn", row=2, col=2, secondary_y=True)
+    fig.update_yaxes(title_text="USD", row=3, col=1)
+    fig.update_yaxes(title_text="Spread (USD)", row=3, col=2, secondary_y=False)
+    fig.update_yaxes(title_text="LFG (USD)", row=3, col=2, secondary_y=True)
+    fig.update_yaxes(title_text="Pool UST", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Pool LUNA", row=4, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Share / Slippage", row=4, col=2, secondary_y=False)
+    fig.update_yaxes(title_text="k (relative)", row=4, col=2, secondary_y=True)
+
+    fig.update_layout(
+        height=1280,
+        showlegend=True,
+        legend_tracegroupgap=8,
+        margin=dict(l=20, r=20, t=60, b=20),
+        template="plotly_white",
+    )
+
+    return fig
+
+
+# ================= Simulation loop config =================
+REDRAW_EVERY = 8   # redraw chart every N steps
+REFRESH_MS = 120   # front-end sleep (ms)
+CHART_HEIGHT = 1320
+
+# ================= Run button =================
+if st.button("Start simulation"):
+    st.info(
+        "🏃 Simulation running… In a few hundred steps: UST slowly de-pegs to a few cents, "
+        "LUNA crashes and supply explodes."
+    )
+
+    st.markdown("---")
+    top_l, top_r = st.columns(2)
+    luna_txt = top_l.empty()
+    ust_txt = top_r.empty()
+
+    chart_box = st.container(height=CHART_HEIGHT, border=True)
+    chart_ph = chart_box.empty()
+
+    prev_luna_supply = state["luna_supply"]
+    prev_ust_supply = state["ust_supply"]
+
+    for step in range(1, 501):  # increase upper bound if you want longer runs
+        contract = stable_contract if use_onchain else None
+        state = simulate_step(state, contract, step=step, use_onchain=use_onchain)
+
+        # Per-step changes
+        luna_minted = max(0.0, state["luna_supply"] - prev_luna_supply)
+        luna_burned = max(0.0, prev_luna_supply - state["luna_supply"])
+        ust_minted = max(0.0, state["ust_supply"] - prev_ust_supply)
+        ust_burned = max(0.0, prev_ust_supply - state["ust_supply"])
+
+        prev_luna_supply = state["luna_supply"]
+        prev_ust_supply = state["ust_supply"]
+
+        # Record data
+        data.append(
+            {
+                "Step": step,
+                "UST Price": float(state.get("ust_price", 0.0)),
+                "LUNA Price": float(state.get("luna_price", 0.0)),
+                "LUNA Supply": float(state.get("luna_supply", 0.0)),
+                "UST Supply": float(state.get("ust_supply", 0.0)),
+                "LUNA Minted": float(luna_minted),
+                "LUNA Burned": float(luna_burned),
+                "UST Minted": float(ust_minted),
+                "UST Burned": float(ust_burned),
+                "AMM LUNA Price (USD)": state.get("amm_luna_price_usd", None),
+                "AMM LUNA Price (UST)": state.get("amm_luna_price_ust", None),
+                "Pool UST": state.get("pool_ust", None),
+                "Pool LUNA": state.get("pool_luna", None),
+                "Slippage": state.get("last_trade_slippage", 0.0),
+                "LFG Reserve": state.get("lfg_reserve_usd", 0.0),
+                "LFG Spent": state.get("lfg_spent_usd", 0.0),
+                "Spread UST": state.get("spread_ust", 0.0),
+                "Spread LUNA": state.get("spread_luna", 0.0),
+                "Pool K": state.get("pool_k", None),
+                "Pool K Rel": state.get("pool_k_rel", None),
+                "Pool UST Share": state.get("pool_ust_share", None),
+            }
+        )
         df = pd.DataFrame(data)
 
-        # === Altair 双图 ===
-        luna_chart = (
-            alt.Chart(df)
-            .mark_line(color="#1f77b4", strokeWidth=2)
-            .encode(
-                x=alt.X("Step:Q", title="模拟步数"),
-                y=alt.Y("LUNA Price:Q", title="LUNA Price (USD)", scale=alt.Scale(domain=(0, max(df['LUNA Price'].max()*1.1, 0.1)))),
-                tooltip=["Step", "LUNA Price"]
-            )
-            .properties(width=400, height=300, title="LUNA 价格走势")
+        # Top-level price labels
+        luna_txt.markdown(
+            f"<div style='font-size:16px'>💎 LUNA price: "
+            f"<b>${state['luna_price']:.6f}</b></div>",
+            unsafe_allow_html=True,
+        )
+        ust_txt.markdown(
+            f"<div style='font-size:16px'>🟩 UST price: "
+            f"<b>${state['ust_price']:.6f}</b></div>",
+            unsafe_allow_html=True,
         )
 
-        ust_chart = (
-            alt.Chart(df)
-            .mark_line(color="#d62728", strokeWidth=2)
-            .encode(
-                x=alt.X("Step:Q", title="模拟步数"),
-                y=alt.Y("UST Price:Q", title="UST Price (USD)", scale=alt.Scale(domain=(0, 1.1))),
-                tooltip=["Step", "UST Price"]
-            )
-            .properties(width=400, height=300, title="UST 价格走势")
-        )
+        # Throttled redraw
+        if step % REDRAW_EVERY == 0 or step in (1, 500):
+            fig = build_figure(df)
+            chart_ph.plotly_chart(fig, use_container_width=True)
 
-        # 左右并列展示，独立Y轴
-        combined_chart = alt.hconcat(luna_chart, ust_chart).resolve_scale(y="independent")
+        time.sleep(REFRESH_MS / 1000.0)
 
-        chart_area.altair_chart(combined_chart, use_container_width=True)
-        time.sleep(0.4 if use_onchain else 0.1)
+    st.success("✅ Simulation finished!")
 
-    st.success("✅ 模拟完成！")
-
-st.caption("提示：左图为 LUNA 价格走势，右图为 UST 价格走势；链上模式下每步调用 setPrice()，速度较慢。")
+st.caption(
+    "If you want to match specific historical anchor points "
+    "(for example: UST ≈ 0.9 at step N, ≈ 0.3 at step M), "
+    "tell me your targets and I can help tune a parameter set to fit them."
+)
