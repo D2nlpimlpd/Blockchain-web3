@@ -2,6 +2,8 @@
 
 Interactive simulator of a Terra-style algorithmic stablecoin system, focusing on the May 2022 LUNA–UST “death spiral”.
 
+The video demonstration webpage link for this project is：https://youtu.be/VXG-TY5stcs3
+
 The project combines:
 
 - A **discrete‑time simulation engine** (Python, in `backend/`)
@@ -333,6 +335,7 @@ The exact interaction pattern with the contract depends on how `backend/controll
   - Calibrate parameters against real market data.
 
 ---
+
 
 
 
